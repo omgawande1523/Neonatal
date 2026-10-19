@@ -1,0 +1,109 @@
+# PROJECT: EdgeSeiz-Net — EEG Seizure Detection (CHB-MIT)
+
+## Who I am
+Om Gawande, B.Tech AI student, St. Vincent Pallotti College of Engineering &
+Technology (SVPCET), Nagpur. Email: omgawande.23@stvincentngp.edu.in
+
+## Goal
+Build a lightweight, edge-deployable (ESP32 / Raspberry Pi class) deep learning
+model for EEG seizure detection, evaluated patient-independently. Intended
+outputs: a Scopus-indexed paper, an Indian patent (device+method framing, not
+algorithm-only, due to Section 3(k)), and a software copyright registration.
+Working title: "EdgeSeiz-Net: A Lightweight Multi-Task Deep Learning Framework
+for Real-Time Seizure Detection and Type Classification on Edge Devices."
+
+## Data
+- CHB-MIT Scalp EEG Database, fully downloaded (~43GB) to Google Drive at
+  /content/drive/MyDrive/chbmit (24 subjects chb01–chb24, 686 EDF files).
+  Binary seizure labels only — NO seizure-type labels.
+- TUH EEG Seizure Corpus (TUSZ): registered, credentials pending. Needed later
+  for the 8-class seizure-TYPE classification claim (FNSZ/GNSZ/SPSZ/CPSZ/ABSZ/
+  TNSZ/TCSZ/MYSZ). Access is via rsync with NEDC credentials. Not yet available.
+
+## WHAT IS ALREADY BUILT AND VERIFIED (do not redo)
+Artifacts saved in Drive under /MyDrive/chbmit:
+- master_annotations.csv — parsed from all chbXX-summary.txt files.
+  733 rows, 24 subjects, 198 seizure events. Columns: subject, file,
+  has_seizure, seizure_start_sec, seizure_end_sec.
+- window_index.csv — 4-second windows, 50% overlap, @256 Hz.
+  1,751,856 total windows; 6,105 seizure (0.35% positive).
+- train_subset.csv — rebalanced training subset at 15:1 non-seizure:seizure.
+  97,680 windows (6,105 seizure + 91,575 non-seizure), random_state=42.
+- shards/ — 673 .npz files of the rebalanced TRAIN subset.
+- test_shards_full/ — 112 .npz files, FULL un-downsampled windows for the 4
+  held-out test subjects. 286,731 windows, 648 seizure, ≈318.6 hours.
+
+Key pipeline decisions already locked in:
+- 18 common bipolar channels, selected BY NAME not index (this was a real bug
+  that was found and fixed — index-based selection mixed up electrodes):
+  FP1-F7, F7-T7, T7-P7, P7-O1, FP1-F3, F3-C3, C3-P3, P3-O1, FP2-F4, F4-C4,
+  C4-P4, P4-O2, FP2-F8, F8-T8, T8-P8, P8-O2, FZ-CZ, CZ-PZ
+- Window tensor shape is uniformly (18, 1024).
+- 3 chb12 files excluded (chb12_27/28/29) — they switch to a non-standard
+  CS2-referential montage. Document this in the paper's methods.
+- Patient-level split, seed 42, never window-level (avoids patient leakage):
+  TEST (held out): chb01, chb09, chb17, chb19
+  TRAIN: the other 20 subjects
+- Evaluation MUST use test_shards_full/ (natural 0.23% imbalance), never the
+  rebalanced subset. Rebalancing is for training only.
+
+## WHAT IS NOT WORKING (the actual open problem)
+Three architectures were trained. All generalize poorly to unseen patients.
+Reported on the full honest test set with temporal smoothing applied:
+
+V1: 5,375 params, raw time-domain input, class_weight 5.0
+    val_auc 0.923, val_recall 0.832 | best FA/hr 61 at recall 0.606;
+    175 FA/hr at recall 0.841
+V2: 37,631 params, per-window z-scored input, class_weight 5.0, no reg
+    val_auc 0.807, val_loss 2.63 (badly overfit) | 378–605 FA/hr
+V3: 5,823 params, z-scored + L2 + BatchNorm + early stopping, class_weight 2.0
+    val_auc 0.740, val_recall 0.557 — worse than V1
+
+Conclusion reached: V1 (the simplest) is still the best generalizer. More
+capacity, normalization, and regularization all made it WORSE, so the problem
+is not model size or overfitting — it is the input representation. Raw
+time-domain amplitude does not transfer across patients.
+
+Window-level precision is near zero (0.003–0.137) at realistic imbalance. This
+is expected and is why the literature reports EVENT-LEVEL sensitivity plus
+false-alarms-per-hour instead. An event-level metric has NOT been implemented
+yet and needs to be.
+
+## NEXT STEPS, IN ORDER
+1. Spectrogram features: convert each (18, 1024) window to log-power STFT
+   (scipy.signal.spectrogram, nperseg=64, noverlap=32 → ~(33, 31, 18)),
+   z-scored per channel across the time-frequency plane. Train a small
+   SeparableConv2D model on this. Benchmark to beat: recall 0.841 @ 175 FA/hr.
+   Precompute spectrograms to disk if on-the-fly is too slow.
+2. Implement event-level sensitivity (was each of the 198 seizure EVENTS
+   detected at all, yes/no) alongside FA/hr. This is the metric reviewers
+   expect; window-level recall alone is not publishable.
+3. If spectrograms don't close the gap, add temporal context across consecutive
+   windows (GRU/LSTM head over a window sequence). NOTE: TFLite Micro cannot
+   convert default Keras LSTM — must use unroll=True with ≤~30 timesteps
+   entering the recurrent layer.
+4. Only once accuracy is acceptable: INT8 quantization + pruning, then TFLite
+   Micro export and on-device latency/memory/power benchmarks on ESP32.
+5. Add Grad-CAM explainability over the EEG/spectrogram.
+6. File the provisional patent BEFORE any public disclosure (preprint,
+   conference, journal submission). India has no broad grace period.
+
+## HOW TO WORK WITH ME
+- I run everything in Google Colab on the free tier, mounting the Drive folder.
+  Sessions expire and crash often, so assume state is lost between messages and
+  give me a single self-contained recovery cell rather than many fragments.
+- Known Colab issues I keep hitting, handle them proactively:
+  (a) Drive FUSE throws "Transport endpoint is not connected" — copy shards to
+      local /content disk with retry + force_remount, never read 600+ files
+      straight off the Drive mount.
+  (b) A partially copied .npz silently becomes a BadZipFile and kills training
+      mid-epoch — validate every shard by forcing a real read before training.
+  (c) Loading all windows into RAM OOMs the runtime — always stream via
+      tf.data.Dataset.from_generator, float32 not float64.
+  (d) SeparableConv1D/2D take depthwise_regularizer and pointwise_regularizer,
+      NOT kernel_regularizer.
+- Give me runnable cells I can paste, one step at a time, and wait for my
+  output before moving on.
+- Be honest about bad results. Tell me when a number is not publishable rather
+  than framing it positively. Several of the fixes above came from correctly
+  calling out a broken metric.
